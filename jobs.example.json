@@ -1,0 +1,10 @@
+[
+  {
+    "url": "https://www.mgeko.cc/manga/example-series/chapter-1/",
+    "chapters": 1,
+    "voice": "en-US-ChristopherNeural",
+    "speed": 1.25,
+    "aspect_ratio": "9:16",
+    "use_llm": false
+  }
+]

@@ -36,6 +36,7 @@ current_job = {
     "progress": 0,
     "chapter_videos": [],
     "merged_video": "",
+    "script_file": "",
     "logs": [],
 }
 
@@ -44,10 +45,14 @@ class GenerateRequest(BaseModel):
     url: Optional[str] = None
     urls: Optional[list[str]] = None
     max_chapters: int = 1
-    voice: str = "en-US-ChristopherNeural"
-    speed: float = 1.25
+    chapter_start: Optional[float] = None
+    chapter_end: Optional[float] = None
+    voice: str = "am_michael"
+    speed: float = 1.0
     aspect_ratio: str = "9:16"
-    use_llm: bool = False
+    use_llm: bool = True
+    merged_only: bool = True
+    enable_ai_context: bool = True
 
 
 def log_progress(msg: str, pct: int):
@@ -65,8 +70,9 @@ async def run_pipeline_task(req: GenerateRequest):
     current_job["logs"] = []
     current_job["chapter_videos"] = []
     current_job["merged_video"] = ""
+    current_job["script_file"] = ""
 
-    speed_rate = f"+{int((req.speed - 1.0) * 100)}%" if req.speed > 1.0 else "0%"
+    speed_rate = f"{int(round((req.speed - 1.0) * 100)):+d}%"
 
     try:
         log_progress("Initializing story pipeline...", 10)
@@ -84,8 +90,10 @@ async def run_pipeline_task(req: GenerateRequest):
                 speed_rate=speed_rate,
                 aspect_ratio=req.aspect_ratio,
                 use_llm=req.use_llm,
+                enable_ai_context=req.enable_ai_context,
                 output_dir=manga_out_dir,
                 workspace_dir=manga_work_dir,
+                merged_only=req.merged_only,
                 progress_callback=log_progress,
             )
         else:
@@ -100,12 +108,16 @@ async def run_pipeline_task(req: GenerateRequest):
                 speed_rate=speed_rate,
                 aspect_ratio=req.aspect_ratio,
                 use_llm=req.use_llm,
+                enable_ai_context=req.enable_ai_context,
                 output_dir=manga_out_dir,
                 workspace_dir=manga_work_dir,
+                merged_only=req.merged_only,
+                chapter_start=req.chapter_start,
+                chapter_end=req.chapter_end,
                 progress_callback=log_progress,
             )
 
-        current_job["chapter_videos"] = [
+        current_job["chapter_videos"] = [] if req.merged_only else [
             str(v.relative_to(Path("output"))) if v.is_relative_to(Path("output")) else v.name
             for v in chapter_videos
         ]
@@ -113,6 +125,12 @@ async def run_pipeline_task(req: GenerateRequest):
             str(merged_video.relative_to(Path("output")))
             if merged_video.is_relative_to(Path("output"))
             else merged_video.name
+        )
+        script_file = merged_video.with_name("all_chapters_script.txt")
+        current_job["script_file"] = (
+            str(script_file.relative_to(Path("output")))
+            if script_file.exists() and script_file.is_relative_to(Path("output"))
+            else ""
         )
         current_job["status"] = "completed"
         log_progress("Video generation finished successfully!", 100)
@@ -165,7 +183,8 @@ async def get_video(filepath: str):
             file_path = matches[0]
         else:
             raise HTTPException(status_code=404, detail="Video file not found")
-    return FileResponse(file_path, media_type="video/mp4")
+    media_type = "text/plain; charset=utf-8" if file_path.suffix == ".txt" else "video/mp4"
+    return FileResponse(file_path, media_type=media_type)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -286,6 +305,30 @@ async def index():
             color: #cbd5e1;
         }
 
+        .field-hint {
+            font-size: 12.5px;
+            color: #8890a4;
+            margin: -2px 0 0 0;
+        }
+
+        .range-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .range-row input {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .range-sep {
+            color: #8890a4;
+            font-size: 14px;
+            font-weight: 600;
+            flex-shrink: 0;
+        }
+
         input, select {
             background: rgba(15, 17, 26, 0.8);
             border: 1px solid rgba(255, 255, 255, 0.12);
@@ -339,6 +382,28 @@ async def index():
             background: var(--accent-gradient);
             color: white;
             border-color: transparent;
+        }
+
+        .checkbox-group {
+            display: flex;
+            align-items: center;
+        }
+
+        .checkbox-label {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 14px;
+            font-weight: 500;
+            color: #cbd5e1;
+            cursor: pointer;
+        }
+
+        .checkbox-label input[type="checkbox"] {
+            width: 18px;
+            height: 18px;
+            accent-color: #8b5cf6;
+            cursor: pointer;
         }
 
         .btn-primary {
@@ -473,8 +538,9 @@ async def index():
                     </div>
 
                     <div class="form-group full-width" id="singleUrlGroup">
-                        <label for="urlInput">Manga Chapter URL</label>
-                        <input type="url" id="urlInput" value="https://www.mgeko.cc/reader/en/return-of-the-mount-hua-sect-chapter-1-eng-li/" placeholder="https://www.mgeko.cc/reader/en/...">
+                        <label for="urlInput">Manga Series or Chapter URL</label>
+                        <input type="url" id="urlInput" value="https://www.mgeko.cc/manga/sl-ragnorak/" placeholder="https://www.mgeko.cc/manga/series-name/  or  .../reader/en/series-chapter-1-eng-li/">
+                        <p class="field-hint">Paste the series page (all chapters, starts from Chapter 1) or a specific chapter page (starts from there).</p>
                     </div>
 
                     <div class="form-group full-width" id="multiUrlGroup" style="display: none;">
@@ -484,29 +550,56 @@ async def index():
 
                     <div class="form-group" id="chaptersGroup">
                         <label for="chaptersInput">Number of Chapters</label>
-                        <select id="chaptersInput">
-                            <option value="1">1 Chapter (Current)</option>
+                        <select id="chaptersInput" onchange="onChaptersModeChange()">
+                            <option value="1">1 Chapter</option>
                             <option value="2">2 Chapters</option>
                             <option value="3">3 Chapters</option>
                             <option value="5">5 Chapters</option>
+                            <option value="10" selected>10 Chapters</option>
+                            <option value="20">20 Chapters</option>
+                            <option value="50">50 Chapters</option>
+                            <option value="custom">Custom Range...</option>
                         </select>
+                    </div>
+
+                    <div class="form-group" id="chapterRangeGroup" style="display: none;">
+                        <label for="chapterStartInput">Chapter Range (e.g. 10 to 20)</label>
+                        <div class="range-row">
+                            <input type="number" id="chapterStartInput" placeholder="Start (e.g. 10)" min="0" step="1">
+                            <span class="range-sep">to</span>
+                            <input type="number" id="chapterEndInput" placeholder="End (e.g. 20)" min="0" step="1">
+                        </div>
                     </div>
 
                     <div class="form-group">
                         <label for="voiceSelect">AI Story Voice</label>
                         <select id="voiceSelect">
-                            <option value="en-US-ChristopherNeural" selected>Christopher (Epic / Cinematic Narrator)</option>
-                            <option value="en-US-GuyNeural">Guy (Deep / Action Hero)</option>
-                            <option value="en-US-AriaNeural">Aria (Expressive Female)</option>
-                            <option value="en-US-AndrewNeural">Andrew (Warm Storyteller)</option>
+                            <optgroup label="Kokoro - runs locally, open source (best quality)">
+                                <option value="am_michael" selected>Michael (Deep Cinematic Narrator)</option>
+                                <option value="am_fenrir">Fenrir (Intense / Action)</option>
+                                <option value="am_adam">Adam (Warm Storyteller)</option>
+                                <option value="bm_george">George (British Narrator)</option>
+                                <option value="bm_fable">Fable (British Storyteller)</option>
+                                <option value="af_heart">Heart (Expressive Female)</option>
+                                <option value="af_bella">Bella (Warm Female)</option>
+                            </optgroup>
+                            <optgroup label="Microsoft neural voices - online fallback">
+                                <option value="en-US-AndrewMultilingualNeural">Andrew (Warm Storyteller)</option>
+                                <option value="en-US-BrianMultilingualNeural">Brian (Casual / Sincere)</option>
+                                <option value="en-US-ChristopherNeural">Christopher (Authority)</option>
+                                <option value="en-US-GuyNeural">Guy (Action Hero)</option>
+                                <option value="en-US-AvaMultilingualNeural">Ava (Expressive Female)</option>
+                                <option value="en-US-AriaNeural">Aria (Confident Female)</option>
+                            </optgroup>
                         </select>
                     </div>
 
                     <div class="form-group">
                         <label for="speedSelect">Voiceover & Frame Speed</label>
                         <select id="speedSelect">
-                            <option value="1.0">1.0x Normal</option>
-                            <option value="1.25" selected>1.25x Dynamic Pacing</option>
+                            <option value="1.0" selected>1.0x Natural (recommended)</option>
+                            <option value="1.1">1.1x Brisk</option>
+                            <option value="1.25">1.25x Dynamic Pacing</option>
                             <option value="1.5">1.5x Fast Paced</option>
                         </select>
                     </div>
@@ -514,9 +607,24 @@ async def index():
                     <div class="form-group">
                         <label for="formatSelect">Video Format</label>
                         <select id="formatSelect">
-                            <option value="16:9" selected>16:9 Landscape (YouTube Story Recap)</option>
-                            <option value="9:16">9:16 Vertical (Shorts / Reels / TikTok)</option>
+                            <option value="9:16" selected>9:16 Vertical (YouTube Story Recap / Shorts / Reels / TikTok)</option>
+                            <option value="16:9">16:9 Landscape</option>
                         </select>
+                    </div>
+
+                    <div class="form-group full-width checkbox-group" style="display: flex; flex-direction: column; gap: 8px;">
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="useLlmInput" checked>
+                            📖 Story Narrator (reads the whole chapter, then narrates it in third person — needs API_KEY)
+                        </label>
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="aiContextInput" checked>
+                            ✨ Add AI Context Images & Badges (bespoke cinematic character & scene visuals)
+                        </label>
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="mergedOnlyInput" checked>
+                            Only keep the merged video (skip saving individual per-chapter videos)
+                        </label>
                     </div>
 
                     <button type="submit" id="generateBtn" class="btn-primary full-width">
@@ -544,6 +652,9 @@ async def index():
                 <a id="downloadMergedBtn" class="download-btn" href="#" download>
                     ⬇️ Download Master Video
                 </a>
+                <a id="downloadScriptBtn" class="download-btn" href="#" download style="display: none;">
+                    📝 Download Narration Script
+                </a>
             </div>
         </section>
     </div>
@@ -559,14 +670,23 @@ async def index():
             document.getElementById('singleUrlGroup').style.display = mode === 'single' ? 'flex' : 'none';
             document.getElementById('multiUrlGroup').style.display = mode === 'multi' ? 'flex' : 'none';
             document.getElementById('chaptersGroup').style.display = mode === 'single' ? 'flex' : 'none';
+            onChaptersModeChange();
+        }
+
+        function onChaptersModeChange() {
+            const isCustom = urlMode === 'single' && document.getElementById('chaptersInput').value === 'custom';
+            document.getElementById('chapterRangeGroup').style.display = isCustom ? 'flex' : 'none';
         }
 
         async function startGeneration() {
             const voice = document.getElementById('voiceSelect').value;
             const speed = parseFloat(document.getElementById('speedSelect').value);
             const aspect_ratio = document.getElementById('formatSelect').value;
+            const merged_only = document.getElementById('mergedOnlyInput').checked;
+            const enable_ai_context = document.getElementById('aiContextInput').checked;
+            const use_llm = document.getElementById('useLlmInput').checked;
 
-            let payload = { voice, speed, aspect_ratio };
+            let payload = { voice, speed, aspect_ratio, merged_only, enable_ai_context, use_llm };
 
             if (urlMode === 'multi') {
                 const urls = document.getElementById('urlsInput').value
@@ -585,7 +705,24 @@ async def index():
                     return;
                 }
                 payload.url = url;
-                payload.max_chapters = parseInt(document.getElementById('chaptersInput').value);
+
+                const chaptersValue = document.getElementById('chaptersInput').value;
+                if (chaptersValue === 'custom') {
+                    const startVal = document.getElementById('chapterStartInput').value;
+                    const endVal = document.getElementById('chapterEndInput').value;
+                    if (startVal === '' || endVal === '') {
+                        alert("Enter both a start and end chapter number for the custom range.");
+                        return;
+                    }
+                    if (parseFloat(startVal) > parseFloat(endVal)) {
+                        alert("Start chapter must be less than or equal to end chapter.");
+                        return;
+                    }
+                    payload.chapter_start = parseFloat(startVal);
+                    payload.chapter_end = parseFloat(endVal);
+                } else {
+                    payload.max_chapters = parseInt(chaptersValue);
+                }
             }
 
             const btn = document.getElementById('generateBtn');
@@ -641,6 +778,13 @@ async def index():
                         const player = document.getElementById('videoPlayer');
                         player.src = videoSrc;
                         document.getElementById('downloadMergedBtn').href = videoSrc;
+                        const scriptBtn = document.getElementById('downloadScriptBtn');
+                        if (data.script_file) {
+                            scriptBtn.href = `/api/videos/${data.script_file}`;
+                            scriptBtn.style.display = '';
+                        } else {
+                            scriptBtn.style.display = 'none';
+                        }
                         document.getElementById('videoSection').style.display = 'flex';
                     }
                 } else if (data.status === 'error') {

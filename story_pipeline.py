@@ -13,11 +13,13 @@ Automated Manhwa Story Video Pipeline
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable, Optional
@@ -27,7 +29,7 @@ from urllib.request import Request, urlopen
 import cv2
 import edge_tts
 import numpy as np
-from PIL import Image, ImageStat
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageStat
 import pytesseract
 
 try:
@@ -37,6 +39,28 @@ except ImportError:
     pass
 
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
+
+
+def resolve_llm_provider() -> Optional[tuple[str, Optional[str], str]]:
+    """
+    Picks the text-generation provider from whatever keys are in .env.
+
+    DeepSeek is preferred when its key is present: it is much cheaper for the long
+    chapter-comprehension prompts and its API is OpenAI-compatible, so only the
+    base URL and model name differ. Returns (api_key, base_url, model), or None
+    when no key is configured at all.
+    """
+    deepseek = os.environ.get("DEEPSEEK_API_KEY")
+    if deepseek:
+        return (
+            deepseek,
+            os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+            os.environ.get("LLM_MODEL", "deepseek-chat"),
+        )
+    openai_key = os.environ.get("API_KEY") or os.environ.get("OPENAI_API_KEY")
+    if openai_key:
+        return openai_key, None, LLM_MODEL
+    return None
 
 
 HEADERS = {
@@ -158,7 +182,7 @@ class ChapterParser(HTMLParser):
             self.raw_script_data.append(data.strip())
 
 
-def fetch_html(url: str) -> str:
+def fetch_html(url: str, retries: int = 3) -> str:
     from urllib.parse import urlparse
     parsed = urlparse(url)
     origin = f"{parsed.scheme}://{parsed.netloc}"
@@ -168,9 +192,17 @@ def fetch_html(url: str) -> str:
         "Origin": origin,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
     }
-    req = Request(url, headers=headers)
-    with urlopen(req, timeout=30) as resp:
-        return resp.read().decode("utf-8", errors="ignore")
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            req = Request(url, headers=headers)
+            with urlopen(req, timeout=30) as resp:
+                return resp.read().decode("utf-8", errors="ignore")
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                time.sleep(2.0 * (attempt + 1))
+    raise last_exc
 
 
 def parse_chapter_number(text_or_url: str) -> Optional[float]:
@@ -199,21 +231,37 @@ def discover_all_chapters(start_url: str) -> list[dict[str, str]]:
     Works universally across dropdown options, link lists, and reader scripts.
     """
     html = fetch_html(start_url)
+
+    # A series landing page (no chapter number of its own) sometimes only lists
+    # its most recent chapters and links to a separate, more complete listing -
+    # follow that when present so a series URL doesn't silently miss early chapters.
+    if parse_chapter_number(start_url) is None:
+        m = re.search(r'href=[\"\']([^\"\']*all-chapters[^\"\']*)[\"\']', html, flags=re.IGNORECASE)
+        if m:
+            all_chapters_url = urljoin(start_url, m.group(1))
+            if all_chapters_url.rstrip("/").lower() != start_url.rstrip("/").lower():
+                try:
+                    html = fetch_html(all_chapters_url)
+                except Exception:
+                    pass
+
     chapters = []
     seen_urls = set()
 
-    # Always ensure the starting URL itself is in the chapter list
-    start_num = parse_chapter_number(start_url) or 1.0
-    start_title = f"Chapter {int(start_num) if start_num.is_integer() else start_num}"
+    # If the start URL is itself a chapter-reader page, make sure it's included -
+    # a series index/listing page (no chapter number of its own) has no such entry,
+    # its real chapters all come from the link scan below.
+    start_num = parse_chapter_number(start_url)
     clean_start = start_url.rstrip("/").lower()
-
-    chapters.append({
-        "url": start_url,
-        "title": start_title,
-        "number": start_num,
-    })
     seen_urls.add(clean_start)
     seen_urls.add(clean_start + "/")
+
+    if start_num is not None:
+        chapters.append({
+            "url": start_url,
+            "title": f"Chapter {int(start_num) if start_num.is_integer() else start_num}",
+            "number": start_num,
+        })
 
     # 1. Search dropdown <option value="...">
     options = re.findall(r'<option\s+[^>]*value=[\"\']([^\"\']+)[\"\'][^>]*>([^<]*)</option>', html, flags=re.IGNORECASE)
@@ -235,23 +283,26 @@ def discover_all_chapters(start_url: str) -> list[dict[str, str]]:
                     "number": ch_num,
                 })
 
-    # 2. Search <a href="..."> chapter links
-    links = re.findall(r'<a\s+[^>]*href=[\"\']([^\"\']+)[\"\'][^>]*>([^<]*)</a>', html, flags=re.IGNORECASE)
-    for href, anchor_text in links:
+    # 2. Search <a href="..."> chapter links. Inner text isn't captured here -
+    # chapter list pages often nest divs/spans inside the <a> before any text
+    # (e.g. mgeko's series page), which a "text with no nested tags" pattern
+    # would silently fail to match at all. The chapter number is parsed from
+    # the URL itself instead, which is reliable on its own.
+    hrefs = re.findall(r'<a\s+[^>]*href=[\"\']([^\"\']+)[\"\']', html, flags=re.IGNORECASE)
+    for href in hrefs:
         href_clean = href.strip()
         if not href_clean or href_clean.startswith("#") or href_clean.startswith("javascript:"):
             continue
         full_url = urljoin(start_url, href_clean)
         clean_full = full_url.rstrip("/").lower()
         if clean_full not in seen_urls:
-            ch_num = parse_chapter_number(full_url) or parse_chapter_number(anchor_text)
+            ch_num = parse_chapter_number(full_url)
             if ch_num is not None:
                 seen_urls.add(clean_full)
                 seen_urls.add(clean_full + "/")
-                display_title = anchor_text.strip() or f"Chapter {int(ch_num) if ch_num.is_integer() else ch_num}"
                 chapters.append({
                     "url": full_url,
-                    "title": display_title,
+                    "title": f"Chapter {int(ch_num) if ch_num.is_integer() else ch_num}",
                     "number": ch_num,
                 })
 
@@ -596,14 +647,27 @@ def convert_dialogue_to_recap_sentence(dialogue: str, page_num: int, total_pages
     d = dialogue.strip()
     if not d:
         return ""
-    rephrased = re.sub(r'[\.\!\?]+$', '', d)
+    m = re.search(r'([\.\!\?]+)$', d)
+    end = "."
+    if m:
+        end = "?" if "?" in m.group(1) else "!" if "!" in m.group(1) else "."
+    rephrased = re.sub(r'[\.\!\?]+$', '', d).strip()
     if not rephrased:
         return ""
 
+    # Manga lettering is all caps; read it as ordinary prose so the voice doesn't
+    # shout and the saved script stays readable.
+    letters = [c for c in rephrased if c.isalpha()]
+    if letters and sum(c.isupper() for c in letters) / len(letters) > 0.7:
+        rephrased = rephrased.lower()
+        rephrased = re.sub(r"\bi\b", "I", rephrased)
+        rephrased = re.sub(r"\bi'", "I'", rephrased)
+        rephrased = re.sub(
+            r'(^|[\.\!\?]\s+)([a-z])', lambda mm: mm.group(1) + mm.group(2).upper(), rephrased
+        )
+
     rephrased = rephrased[0].upper() + rephrased[1:]
-    if not rephrased.endswith(('.', '!', '?')):
-        rephrased += '.'
-    return rephrased
+    return rephrased + end
 
 
 def is_promo_cover(img: Image.Image, raw_text: str, height: int) -> bool:
@@ -698,116 +762,248 @@ def slice_into_panels(page_paths: list[Path], output_dir: Path) -> list[dict]:
     return all_slices
 
 
+MAX_PANELS_PER_BEAT = 3
+MAX_WORDS_PER_BEAT = 30
+MIN_SECONDS_PER_PANEL = 1.8
+_SECONDS_PER_WORD = 0.4
+
+
+def _estimate_speech_seconds(text: str) -> float:
+    return 0.6 + _SECONDS_PER_WORD * len(text.split())
+
+
+def _narration_chunks(raw_text: str) -> list[str]:
+    """
+    Turns an OCR'd dialogue run into narration lines: each clause becomes a clean
+    sentence (keeping its ? or ! so the voice gets the intonation right), and
+    consecutive sentences are packed together up to a comfortable length so one
+    still image isn't held for a whole paragraph.
+    """
+    parts = re.split(r'([\.\!\?]+)\s*', raw_text)
+    sentences: list[str] = []
+    for i in range(0, len(parts), 2):
+        clause = parts[i].strip()
+        punct = parts[i + 1] if i + 1 < len(parts) else ""
+        if len(clause.split()) < 2:
+            continue
+        end = "?" if "?" in punct else "!" if "!" in punct else ""
+        sent = convert_dialogue_to_recap_sentence(clause + end, 1, 1)
+        if sent:
+            sentences.append(sent)
+
+    chunks: list[str] = []
+    current: list[str] = []
+    for sent in sentences:
+        if current and len(" ".join(current + [sent]).split()) > MAX_WORDS_PER_BEAT:
+            chunks.append(" ".join(current))
+            current = []
+        current.append(sent)
+    if current:
+        chunks.append(" ".join(current))
+    return chunks
+
+
 def generate_story_beats(
     panel_slices: list[dict],
     chapter_title: str,
     aspect_ratio: str = "16:9"
 ) -> list[dict]:
     """
-    Builds a continuous, cinematic 3rd-person YouTube-style story recap script
-    strictly synchronized 1:1 with what is shown on screen.
+    Turns the ordered panel slices into narration beats. Each beat is one line of
+    narration plus the panel(s) shown while it plays:
+
+    - Dialogue is spoken over the panel it was read from when that panel has artwork.
+    - Dialogue from a text-only bubble is held and spoken over the next artwork panel.
+    - Wordless artwork panels ride along with a neighbouring line - shown before the
+      dialogue panel they lead into, or after the line they follow - so the camera
+      keeps moving while the narration continues. A filler line is used only when a
+      stretch of wordless art has no dialogue nearby to ride on.
     """
-    story_beats = []
-    action_idx = 0
+    beats: list[dict] = []
+    pending_text: list[str] = []
+    orphan_panels: list[Path] = []
     last_narration = ""
-    last_panel_path: Optional[Path] = None
-    text_buffer = []
+    last_panel: Optional[Path] = None
+    last_seen_panel: Optional[Path] = None
+    action_idx = 0
+
+    def add_beat(narration: str, panels: list[Path], primary: Path, page) -> dict:
+        beat = {
+            "id": f"beat_{len(beats) + 1:03d}",
+            "panel": primary,
+            "panels": list(panels),
+            "narration": narration,
+            "page": page,
+        }
+        beats.append(beat)
+        return beat
+
+    def panels_that_fit(narration: str, extra: int) -> int:
+        """How many of `extra` wordless panels a line can carry without rushing."""
+        fit = 0
+        for n in range(1, extra + 1):
+            if n + 1 > MAX_PANELS_PER_BEAT:
+                break
+            if _estimate_speech_seconds(narration) / (n + 1) < MIN_SECONDS_PER_PANEL:
+                break
+            fit = n
+        return fit
+
+    def flush_orphans_as_filler(page) -> None:
+        nonlocal orphan_panels, last_narration, action_idx
+        if not orphan_panels:
+            return
+        filler = DYNAMIC_ACTION_BEATS[action_idx % len(DYNAMIC_ACTION_BEATS)]
+        action_idx += 1
+        add_beat(filler, orphan_panels, orphan_panels[0], page)
+        last_narration = filler
+        orphan_panels = []
 
     for s in panel_slices:
-        panel_path: Path = s["path"]
-        score: float = s["score"]
-        is_text: bool = s["is_text_heavy"]
-        clean_text: str = s["text"]
+        panel: Path = s["path"]
+        is_bubble_only = s["is_text_heavy"] and s["score"] < 12.0
+        last_seen_panel = panel
 
-        if clean_text:
-            text_buffer.append(clean_text)
-
-        # If this is a speech bubble box only (no character/art), buffer its text to speak over the next character panel
-        if is_text and score < 12.0:
+        if s["text"]:
+            pending_text.append(s["text"])
+        if is_bubble_only:
             continue
+        if last_panel is not None and are_images_duplicate(panel, last_panel):
+            continue
+        last_panel = panel
 
-        # This is a visual/character artwork panel
-        if text_buffer:
-            combined_text = " ".join(text_buffer)
-            # Split into natural recap thoughts if long
-            clauses = re.split(r'[\.\!\?]+\s*', combined_text)
-            valid_clauses = [c.strip() for c in clauses if len(c.strip().split()) >= 2]
-
-            if valid_clauses:
-                for clause in valid_clauses:
-                    recap_sent = convert_dialogue_to_recap_sentence(clause, 1, 1)
-                    if not recap_sent or (last_narration and are_phrases_similar(recap_sent, last_narration)):
-                        continue
-
-                    chosen_panel = panel_path
-                    if last_panel_path and are_images_duplicate(chosen_panel, last_panel_path):
-                        chosen_panel = panel_path
-
-                    story_beats.append({
-                        "id": f"beat_{len(story_beats)+1:03d}",
-                        "panel": chosen_panel,
-                        "narration": recap_sent,
-                        "page": s["page"],
-                    })
-                    last_narration = recap_sent
-                    last_panel_path = chosen_panel
-            text_buffer = []
-        else:
-            # Give every non-duplicate art panel its own action beat, cycling through
-            # filler lines so consecutive beats don't repeat the same sentence verbatim.
-            chosen_panel = panel_path
-            if last_panel_path and are_images_duplicate(chosen_panel, last_panel_path):
+        if pending_text:
+            raw = " ".join(pending_text)
+            pending_text = []
+            chunks = [
+                c for c in _narration_chunks(raw)
+                if not (last_narration and are_phrases_similar(c, last_narration))
+            ]
+            if chunks:
+                # Lead into the dialogue with the wordless panels that preceded it.
+                lead_in = panels_that_fit(chunks[0], len(orphan_panels))
+                if lead_in < len(orphan_panels):
+                    kept = orphan_panels[len(orphan_panels) - lead_in:] if lead_in else []
+                    orphan_panels = orphan_panels[:len(orphan_panels) - lead_in]
+                    flush_orphans_as_filler(s["page"])
+                    orphan_panels = kept
+                add_beat(chunks[0], orphan_panels + [panel], panel, s["page"])
+                orphan_panels = []
+                for chunk in chunks[1:]:
+                    add_beat(chunk, [panel], panel, s["page"])
+                last_narration = chunks[-1]
                 continue
 
-            act_sent = DYNAMIC_ACTION_BEATS[action_idx % len(DYNAMIC_ACTION_BEATS)]
-            action_idx += 1
+        # Wordless artwork: ride along with the previous line if it has room.
+        if beats and not orphan_panels:
+            prev = beats[-1]
+            if panels_that_fit(prev["narration"], len(prev["panels"])) >= len(prev["panels"]):
+                prev["panels"].append(panel)
+                continue
 
-            story_beats.append({
-                "id": f"beat_{len(story_beats)+1:03d}",
-                "panel": chosen_panel,
-                "narration": act_sent,
-                "page": s["page"],
-            })
-            last_narration = act_sent
-            last_panel_path = chosen_panel
+        orphan_panels.append(panel)
+        if len(orphan_panels) >= MAX_PANELS_PER_BEAT:
+            flush_orphans_as_filler(s["page"])
 
-    # Flush any remaining dialogue at the end
-    if text_buffer and story_beats:
-        rem_text = " ".join(text_buffer)
-        recap_sent = convert_dialogue_to_recap_sentence(rem_text, 1, 1)
-        if recap_sent:
-            story_beats.append({
-                "id": f"beat_{len(story_beats)+1:03d}",
-                "panel": story_beats[-1]["panel"],
-                "narration": recap_sent,
-                "page": story_beats[-1]["page"],
-            })
+    if orphan_panels:
+        if beats:
+            beats[-1]["panels"].extend(orphan_panels[: MAX_PANELS_PER_BEAT - 1])
+            orphan_panels = orphan_panels[MAX_PANELS_PER_BEAT - 1:]
+        flush_orphans_as_filler(panel_slices[-1]["page"] if panel_slices else "")
 
-    return story_beats
+    if pending_text:
+        # Falls back to the last bubble-only panel seen when a whole chapter never
+        # produced an art panel to hang narration on (e.g. an all-dialogue page) -
+        # without this, that dialogue was silently dropped and the chapter failed
+        # with "no narration beats could be generated".
+        tail_panel = beats[-1]["panel"] if beats else last_seen_panel
+        tail_page = beats[-1]["page"] if beats else (panel_slices[-1]["page"] if panel_slices else "")
+        if tail_panel is not None:
+            for chunk in _narration_chunks(" ".join(pending_text)):
+                if last_narration and are_phrases_similar(chunk, last_narration):
+                    continue
+                add_beat(chunk, [tail_panel], tail_panel, tail_page)
+                last_narration = chunk
+
+    return beats
+
+
+def _llm_json(client, prompt: str, max_tokens: int, temperature: float = 0.5,
+              model: Optional[str] = None):
+    """Calls the model and parses a JSON reply, tolerating ```json fences."""
+    response = client.chat.completions.create(
+        model=model or LLM_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    raw = response.choices[0].message.content.strip()
+    raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw.strip())
+    import json
+    return json.loads(raw)
+
+
+def _comprehend_chapter(client, chapter_title: str, panel_manifest: str,
+                        model: Optional[str] = None) -> Optional[dict]:
+    """
+    Pass 1: read the whole chapter and work out what actually happens in it.
+
+    OCR gives unattributed, often garbled speech fragments. Narrating those line by
+    line produces disjointed text that doesn't track the story, so first the model
+    reconstructs the chapter - who is in it, what happens, in what order - and that
+    understanding is what gets narrated in pass 2.
+    """
+    prompt = (
+        f'Below is OCR text extracted from the panels of a manga/manhwa chapter titled '
+        f'"{chapter_title}", in reading order. The OCR is noisy: words may be misspelled, '
+        f'speech may be split across panels or merged out of order, and speakers are never '
+        f'labelled. ART panels have no text.\n\n'
+        f'{panel_manifest}\n\n'
+        f'Read the whole chapter and work out what is actually happening. Infer who is '
+        f'speaking from context, correct obvious OCR corruption, and ignore watermarks, '
+        f'credits and scanlation notes.\n\n'
+        f'Respond with ONLY JSON:\n'
+        f'{{"characters": [{{"name": "<name as best you can tell>", "role": "<one phrase>"}}],\n'
+        f'  "setting": "<one sentence on where/when this takes place>",\n'
+        f'  "synopsis": "<5-8 sentences telling what happens in this chapter, in order, '
+        f'as a story>",\n'
+        f'  "beats": ["<short phrase for each major story beat, in order>"]}}\n'
+        f'If a character\'s name is never legible, describe them instead ("the masked swordsman"). '
+        f'Never invent plot that the panels do not support.'
+    )
+    try:
+        data = _llm_json(client, prompt, max_tokens=1200, temperature=0.3, model=model)
+        if isinstance(data, dict) and data.get("synopsis"):
+            return data
+    except Exception as exc:
+        print(f"[WARN] Chapter comprehension failed: {exc}")
+    return None
 
 
 def generate_llm_story_beats(
     panel_slices: list[dict],
     chapter_title: str,
     aspect_ratio: str = "16:9",
-) -> Optional[list[dict]]:
+    story_context: Optional[dict] = None,
+) -> Optional[tuple[list[dict], Optional[dict]]]:
     """
-    LLM-based alternative to generate_story_beats(). Sends the OCR'd panel text
-    for the whole chapter to a cheap model in a single call and asks for a
-    cinematic third-person recap narration line per beat. Falls back to None
-    (caller should use the regex-based generate_story_beats) if no API key is
-    configured or the call fails, so this is always an opt-in enhancement.
+    Writes the narration by first understanding the chapter, then telling it.
 
-    Output contract matches generate_story_beats(): list of
-    {id, panel, narration, page} dicts, so downstream TTS/render code is
-    untouched.
+    Pass 1 reconstructs the story from the noisy OCR. Pass 2 writes continuous
+    third-person narration of that story and assigns each sentence to the panel
+    range it describes, so the voice and the art stay in step.
+
+    Returns (beats, chapter_summary) or None when no API key is set or a call
+    fails, in which case the caller falls back to generate_story_beats().
+
+    `story_context` carries what happened in previous chapters so narration across a
+    multi-chapter video reads as one continuous story.
     """
-    api_key = os.environ.get("API_KEY") or os.environ.get("OPENAI_API_KEY")
-    if not api_key:
+    provider = resolve_llm_provider()
+    if provider is None:
         return None
+    api_key, base_url, model = provider
 
-    # Only panels that actually have usable OCR text or are visual/character
-    # panels worth narrating are sent - keeps the prompt (and cost) small.
     candidates = [s for s in panel_slices if s["text"] or not s["is_text_heavy"]]
     if not candidates:
         return None
@@ -820,70 +1016,115 @@ def generate_llm_story_beats(
     lines = []
     for i, s in enumerate(candidates):
         kind = "DIALOGUE" if s["text"] else "ART"
-        text = s["text"] if s["text"] else "(no text, character/action panel)"
+        text = s["text"] if s["text"] else "(no text - character/action artwork)"
         lines.append(f"{i}. [{kind}] {text}")
     panel_manifest = "\n".join(lines)
 
+    try:
+        client = OpenAI(api_key=api_key, base_url=base_url) if base_url else OpenAI(api_key=api_key)
+    except Exception:
+        return None
+
+    understanding = _comprehend_chapter(client, chapter_title, panel_manifest, model)
+    if not understanding:
+        return None
+
+    cast = ", ".join(
+        f"{c.get('name', '?')} ({c.get('role', '')})".strip()
+        for c in understanding.get("characters", [])[:8]
+    )
+
+    previously = ""
+    if story_context and story_context.get("running_summary"):
+        previously = (
+            f"PREVIOUSLY IN THE STORY (do not re-narrate, use only for continuity "
+            f"and to keep character names consistent):\n{story_context['running_summary']}\n\n"
+        )
+
+    last_index = len(candidates) - 1
     prompt = (
-        f"You are writing a cinematic third-person YouTube recap narration for a manga/manhwa "
-        f"chapter titled \"{chapter_title}\".\n\n"
-        f"Below is the ordered sequence of panels in this chapter. Each has an index, a kind "
-        f"(DIALOGUE = has OCR'd speech/text, ART = a visual/action panel with no text), and the "
-        f"raw OCR text if any.\n\n"
-        f"{panel_manifest}\n\n"
-        f"Write a short third-person recap sentence for each panel that should be narrated. "
-        f"Skip panels that add nothing (empty bubbles, redundant lines). Merge consecutive "
-        f"DIALOGUE panels into one sentence when they form a single thought. For ART panels, "
-        f"write a brief cinematic action/atmosphere line. Keep sentences short (under 20 words), "
-        f"natural to read aloud, and consistent in character names.\n\n"
-        f"Respond with ONLY a JSON array, no prose, in this exact shape:\n"
-        f'[{{"panel_index": <int>, "narration": "<sentence>"}}, ...]\n'
-        f"panel_index must reference the index numbers above, in ascending order."
+        f'{previously}'
+        f'You are the narrator of a manga recap video. This is what happens in the '
+        f'current chapter:\n\n'
+        f'CAST: {cast}\n'
+        f'SETTING: {understanding.get("setting", "")}\n'
+        f'WHAT HAPPENS: {understanding.get("synopsis", "")}\n\n'
+        f'These are the chapter\'s panels in reading order, with their OCR text:\n\n'
+        f'{panel_manifest}\n\n'
+        f'Narrate this chapter as one continuous third-person story, the way a good recap '
+        f'channel tells it, and split that narration across the panels so each sentence is '
+        f'spoken while the art it describes is on screen.\n\n'
+        f'Rules:\n'
+        f'- Third person, past tense. Never "I" or "you" - convert dialogue into narration '
+        f'("Itadori admitted he had never seen a curse before"), do not quote it raw.\n'
+        f'- It must read as a flowing story, not panel-by-panel captions. Connect events '
+        f'with cause and consequence.\n'
+        f'- Name characters instead of saying "he"/"the man" wherever you can.\n'
+        f'- Each entry covers a consecutive run of panels: "from" to "to" inclusive. The runs '
+        f'must be in ascending order, must not overlap, and together must cover panels 0 to '
+        f'{last_index} with no gaps.\n'
+        f'- Give a wordless stretch of action panels a single sentence spanning that run '
+        f'rather than one sentence per panel.\n'
+        f'- 12 to 30 words per sentence - long enough to sound natural read aloud.\n'
+        f'- Do not mention panels, pages, art or the reader. Never narrate the OCR noise.\n\n'
+        f'Respond with ONLY a JSON array:\n'
+        f'[{{"from": <int>, "to": <int>, "narration": "<sentence>"}}, ...]'
     )
 
     try:
-        client = OpenAI(api_key=api_key)
-        response = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.4,
-            max_tokens=2000,
-        )
-        raw = response.choices[0].message.content.strip()
-    except Exception:
+        parsed = _llm_json(client, prompt, max_tokens=4000, temperature=0.6, model=model)
+    except Exception as exc:
+        print(f"[WARN] LLM narration failed: {exc}")
+        return None
+    if not isinstance(parsed, list):
         return None
 
-    import json
-    raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw.strip())
-    try:
-        parsed = json.loads(raw)
-    except Exception:
-        return None
-
-    story_beats = []
-    last_panel_path: Optional[Path] = None
+    story_beats: list[dict] = []
+    covered = 0
     for item in parsed:
         try:
-            idx = int(item["panel_index"])
+            start = int(item["from"])
+            end = int(item["to"])
             narration = str(item["narration"]).strip()
         except (KeyError, ValueError, TypeError):
             continue
-        if not narration or idx < 0 or idx >= len(candidates):
+        if not narration:
             continue
 
-        panel_path = candidates[idx]["path"]
-        if last_panel_path and are_images_duplicate(panel_path, last_panel_path):
-            panel_path = last_panel_path if last_panel_path else panel_path
+        # Clamp to the real panel range and keep runs moving forward, so a model
+        # slip can't drop panels or show them out of order.
+        start = max(start, covered)
+        end = max(min(end, last_index), start)
+        if start > last_index:
+            continue
+
+        panels: list[Path] = []
+        for s in candidates[start:end + 1]:
+            if panels and are_images_duplicate(s["path"], panels[-1]):
+                continue
+            panels.append(s["path"])
+        if not panels:
+            continue
 
         story_beats.append({
             "id": f"beat_{len(story_beats)+1:03d}",
-            "panel": panel_path,
+            "panel": panels[0],
+            "panels": panels,
             "narration": narration,
-            "page": candidates[idx]["page"],
+            "page": candidates[start]["page"],
         })
-        last_panel_path = panel_path
+        covered = end + 1
 
-    return story_beats if story_beats else None
+    if not story_beats:
+        return None
+
+    # Any panels the model left off the end still get shown, under the last line.
+    if covered <= last_index:
+        for s in candidates[covered:]:
+            if not are_images_duplicate(s["path"], story_beats[-1]["panels"][-1]):
+                story_beats[-1]["panels"].append(s["path"])
+
+    return story_beats, understanding
 
 
 def get_audio_duration(audio_path: Path) -> float:
@@ -905,106 +1146,292 @@ def get_audio_duration(audio_path: Path) -> float:
     return max(float(result.stdout.strip()), 0.8)
 
 
+# ---------------------------------------------------------------------------
+# Text-to-speech
+#
+# Two engines. Kokoro (open-source, runs fully offline on this machine) is the
+# preferred one - it is markedly more natural than the network voices. edge-tts
+# (Microsoft neural voices) is the fallback when Kokoro isn't installed. Every
+# clip then goes through the same finishing pass so loudness, silence trimming
+# and sample rate are identical whichever engine produced it.
+# ---------------------------------------------------------------------------
+
+# Kokoro voice id -> closest edge-tts voice, used when Kokoro is unavailable.
+KOKORO_VOICES = {
+    "am_michael": "en-US-AndrewMultilingualNeural",
+    "am_fenrir": "en-US-GuyNeural",
+    "am_adam": "en-US-BrianMultilingualNeural",
+    "am_onyx": "en-US-ChristopherNeural",
+    "af_heart": "en-US-AvaMultilingualNeural",
+    "af_bella": "en-US-AriaNeural",
+    "bm_george": "en-GB-RyanNeural",
+    "bm_fable": "en-GB-RyanNeural",
+    "bf_emma": "en-GB-SoniaNeural",
+}
+
+_kokoro_pipelines: dict = {}
+_kokoro_fallback_warned = False
+
+
+def kokoro_available() -> bool:
+    try:
+        import kokoro  # noqa: F401
+        import soundfile  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _speed_rate_to_factor(speed_rate: str) -> float:
+    m = re.match(r'^\s*([+-]?\d+)\s*%\s*$', speed_rate)
+    return 1.0 + int(m.group(1)) / 100.0 if m else 1.0
+
+
+def _normalise_edge_rate(speed_rate: str) -> str:
+    # edge-tts rejects an unsigned rate like "0%".
+    s = speed_rate.strip()
+    return s if s.startswith(("+", "-")) else f"+{s}"
+
+
+def _kokoro_pipeline(lang_code: str):
+    if lang_code not in _kokoro_pipelines:
+        from kokoro import KPipeline
+        _kokoro_pipelines[lang_code] = KPipeline(lang_code=lang_code)
+    return _kokoro_pipelines[lang_code]
+
+
+def _synthesize_kokoro(text: str, wav_path: Path, voice: str, speed: float) -> None:
+    import soundfile as sf
+
+    pipeline = _kokoro_pipeline(voice[0])  # 'a' = American English, 'b' = British English
+    chunks = []
+    for item in pipeline(text, voice=voice, speed=speed):
+        audio = getattr(item, "audio", None)
+        if audio is None and isinstance(item, (tuple, list)):
+            audio = item[2]
+        if audio is None:
+            continue
+        if hasattr(audio, "numpy"):
+            audio = audio.numpy()
+        audio = np.asarray(audio, dtype=np.float32)
+        if audio.size:
+            chunks.append(audio)
+    if not chunks:
+        raise RuntimeError("Kokoro produced no audio for this line")
+    sf.write(str(wav_path), np.concatenate(chunks), 24000)
+
+
+def _finalize_voice_clip(raw_path: Path, output_path: Path) -> None:
+    """
+    Trims dead air from both ends (keeping a short breath so words aren't clipped),
+    normalises to broadcast loudness, adds a brief pause after the line, and writes
+    48 kHz mono PCM so the render step never re-decodes lossy audio.
+    """
+    af = (
+        "silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.08,"
+        "areverse,silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.12,areverse,"
+        "loudnorm=I=-16:TP=-1.5:LRA=11,"
+        "apad=pad_dur=0.35,"
+        "aresample=48000"
+    )
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", str(raw_path), "-af", af, "-ac", "1", "-ar", "48000",
+         "-c:a", "pcm_s16le", str(output_path)],
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    )
+
+
 async def synthesize_voiceover(
     text: str,
     output_path: Path,
-    voice: str = "en-US-ChristopherNeural",
-    speed_rate: str = "+25%",
+    voice: str = "am_michael",
+    speed_rate: str = "+0%",
+    retries: int = 3,
 ) -> None:
+    """
+    Both engines occasionally fail transiently on a single line (dropped connection,
+    empty audio); without the retry that exception used to propagate up and silently
+    drop the whole chapter from the merged video.
+    """
+    global _kokoro_fallback_warned
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    communicate = edge_tts.Communicate(text, voice, rate=speed_rate)
-    await communicate.save(str(output_path))
+
+    use_kokoro = voice in KOKORO_VOICES or ("_" in voice and "-" not in voice)
+    if use_kokoro and not kokoro_available():
+        fallback = KOKORO_VOICES.get(voice, "en-US-AndrewMultilingualNeural")
+        if not _kokoro_fallback_warned:
+            print(f"[WARN] Kokoro TTS is not installed - using edge-tts voice {fallback} instead "
+                  f"(pip install kokoro soundfile to enable the local voice).")
+            _kokoro_fallback_warned = True
+        voice, use_kokoro = fallback, False
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            if use_kokoro:
+                raw_path = output_path.with_suffix(".raw.wav")
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None, _synthesize_kokoro, text, raw_path, voice, _speed_rate_to_factor(speed_rate)
+                )
+            else:
+                raw_path = output_path.with_suffix(".raw.mp3")
+                communicate = edge_tts.Communicate(text, voice, rate=_normalise_edge_rate(speed_rate))
+                await communicate.save(str(raw_path))
+            _finalize_voice_clip(raw_path, output_path)
+            raw_path.unlink(missing_ok=True)
+            return
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                await asyncio.sleep(1.5 * (attempt + 1))
+    raise last_exc
+
+
+VIDEO_FPS = 30
+# The push-in zooms from 1.0 to this; frames are composed slightly larger than the
+# output so the zoomed crop never has to upscale past the panel's native pixels.
+KEN_BURNS_ZOOM = 1.06
+
+
+def compose_panel_frame(panel_path: Path, width: int, height: int, frames_dir: Path) -> Path:
+    """
+    Builds the full video frame for a panel - blurred, darkened cover-fit background
+    with the panel contain-fit on top - as a cached image. Doing this once per panel
+    in PIL (instead of inside every ffmpeg call) keeps the render filter graph a single
+    uniform image stream, which is what makes the multi-panel zoom reliable.
+    """
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    canvas_w = int(width * KEN_BURNS_ZOOM * 1.02) // 2 * 2
+    canvas_h = int(height * KEN_BURNS_ZOOM * 1.02) // 2 * 2
+    out = frames_dir / f"{panel_path.stem}_{canvas_w}x{canvas_h}.jpg"
+    if out.exists():
+        return out
+
+    img = Image.open(panel_path).convert("RGB")
+    bg = ImageOps.fit(img, (canvas_w, canvas_h), method=Image.LANCZOS)
+    bg = bg.filter(ImageFilter.GaussianBlur(radius=max(14, canvas_w // 60)))
+    bg = ImageEnhance.Brightness(bg).enhance(0.5)
+    fg = ImageOps.contain(img, (canvas_w, canvas_h), method=Image.LANCZOS)
+    bg.paste(fg, ((canvas_w - fg.width) // 2, (canvas_h - fg.height) // 2))
+    bg.save(out, quality=93)
+    return out
 
 
 def render_frame_video(
-    panel_path: Path,
+    frame_paths,
     audio_path: Path,
     output_path: Path,
     duration: float,
     width: int = 1080,
     height: int = 1920,
 ) -> None:
+    """
+    Renders one narration beat: the line plays once while its frame(s) are shown in
+    sequence, each with a slow push-in.
+
+    The output is frame-exact. The video track is rounded up to a whole number of
+    frames and the audio is padded to precisely that length - a mismatch of even a
+    single frame per segment compounds across the hundred-odd segments in a chapter
+    into clearly audible drift between the voice and the panels.
+    """
+    if isinstance(frame_paths, (str, Path)):
+        frame_paths = [frame_paths]
+    frames = [Path(p) for p in frame_paths]
+    if not frames:
+        raise ValueError("render_frame_video needs at least one frame")
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    frames_per_panel = max(VIDEO_FPS // 2, math.ceil(duration * VIDEO_FPS / len(frames)))
+    total_frames = frames_per_panel * len(frames)
+    total_duration = total_frames / VIDEO_FPS
+
+    list_path = output_path.with_suffix(".frames.txt")
+    with open(list_path, "w", encoding="utf-8") as f:
+        for p in frames:
+            f.write(f"file '{p.resolve()}'\n")
+
+    zoom_step = (KEN_BURNS_ZOOM - 1.0) / max(frames_per_panel - 1, 1)
     vf = (
-        f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},boxblur=25:5[bg];"
-        f"[0:v]scale={width}:{height}:force_original_aspect_ratio=decrease[fg];"
-        f"[bg][fg]overlay=(W-w)/2:(H-h)/2[outv]"
+        f"[0:v]setsar=1,"
+        f"zoompan=z='1+{zoom_step:.6f}*on':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+        f":d={frames_per_panel}:s={width}x{height}:fps={VIDEO_FPS},format=yuv420p[outv];"
+        f"[1:a]apad=whole_dur={total_duration:.4f},aresample=48000[outa]"
     )
 
     cmd = [
-        "ffmpeg",
-        "-y",
-        "-loop",
-        "1",
-        "-i",
-        str(panel_path),
-        "-i",
-        str(audio_path),
-        "-filter_complex",
-        vf,
-        "-map",
-        "[outv]",
-        "-map",
-        "1:a",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "20",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        "-r",
-        "30",
-        "-t",
-        f"{duration:.3f}",
+        "ffmpeg", "-y",
+        "-f", "concat", "-safe", "0", "-i", str(list_path),
+        "-i", str(audio_path),
+        "-filter_complex", vf,
+        "-map", "[outv]", "-map", "[outa]",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+        "-pix_fmt", "yuv420p", "-r", str(VIDEO_FPS), "-fps_mode", "cfr",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+        "-t", f"{total_duration:.4f}",
         str(output_path),
     ]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    list_path.unlink(missing_ok=True)
+
+
+def _probe_video_duration(path: Path) -> float:
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+        check=True, capture_output=True, text=True,
+    )
+    value = result.stdout.strip()
+    if not value or value == "N/A":
+        return get_audio_duration(path)
+    return float(value)
 
 
 def concat_video_segments(segment_paths: list[Path], final_output: Path) -> None:
+    """
+    Joins segments into one video. The video track is concatenated and re-encoded
+    (so differing resolutions/frame rates can't silently break it), but the audio is
+    rebuilt from each segment's decoded audio padded to that segment's exact video
+    length and joined as PCM. Letting ffmpeg concatenate the AAC streams directly
+    adds roughly 10 ms of encoder priming at every join, which over the hundred-plus
+    segments in a chapter drifted the voice a full second out of sync by the end.
+    """
     if not segment_paths:
         raise RuntimeError(
             f"No video segments to assemble for '{final_output.name}' - "
             f"nothing was rendered upstream (check scraping/panel-slicing/narration steps)."
         )
     final_output.parent.mkdir(parents=True, exist_ok=True)
-    concat_list = final_output.parent / f"concat_{final_output.stem}.txt"
-    with open(concat_list, "w", encoding="utf-8") as f:
-        for p in segment_paths:
-            f.write(f"file '{p.resolve()}'\n")
+    work_dir = final_output.parent / f".concat_{final_output.stem}"
+    work_dir.mkdir(exist_ok=True)
+
+    video_list = work_dir / "video.txt"
+    audio_list = work_dir / "audio.txt"
+    with open(video_list, "w", encoding="utf-8") as vf, open(audio_list, "w", encoding="utf-8") as af:
+        for i, p in enumerate(segment_paths):
+            video_seconds = _probe_video_duration(p)
+            wav = work_dir / f"{i:04d}.wav"
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", str(p), "-vn",
+                 "-af", f"apad=whole_dur={video_seconds:.4f}", "-t", f"{video_seconds:.4f}",
+                 "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", str(wav)],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            )
+            vf.write(f"file '{p.resolve()}'\n")
+            af.write(f"file '{wav.resolve()}'\n")
 
     cmd = [
-        "ffmpeg",
-        "-y",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        str(concat_list),
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "20",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
+        "ffmpeg", "-y",
+        "-f", "concat", "-safe", "0", "-i", str(video_list),
+        "-f", "concat", "-safe", "0", "-i", str(audio_list),
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+        "-pix_fmt", "yuv420p", "-r", str(VIDEO_FPS), "-fps_mode", "cfr",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
         str(final_output),
     ]
-    subprocess.run(cmd, check=True)
-    if concat_list.exists():
-        concat_list.unlink()
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def discover_series_chapter_videos(output_dir: Path) -> list[Path]:
@@ -1029,7 +1456,9 @@ async def process_single_chapter(
     voice: str = "en-US-ChristopherNeural",
     speed_rate: str = "+25%",
     aspect_ratio: str = "16:9",
-    use_llm: bool = False,
+    use_llm: bool = True,
+    enable_ai_context: bool = False,
+    story_context: Optional[dict] = None,
     progress_callback: Optional[Callable[[str, int], None]] = None,
 ) -> Path:
     ch_num = chapter_info["number"]
@@ -1077,7 +1506,23 @@ async def process_single_chapter(
 
     beats = None
     if use_llm:
-        beats = generate_llm_story_beats(panel_entries, ch_title, aspect_ratio=aspect_ratio)
+        if progress_callback:
+            progress_callback(f"Reading Chapter {ch_num} and writing the story...", 55)
+        result = generate_llm_story_beats(
+            panel_entries, ch_title, aspect_ratio=aspect_ratio, story_context=story_context
+        )
+        if result is not None:
+            beats, understanding = result
+            if story_context is not None and understanding:
+                # Carry this chapter forward so later chapters narrate as one story.
+                story_context.setdefault("chapters", []).append(
+                    f"Chapter {ch_num}: {understanding.get('synopsis', '')}"
+                )
+                story_context["running_summary"] = "\n".join(story_context["chapters"][-6:])
+                for c in understanding.get("characters", []):
+                    name = (c.get("name") or "").strip()
+                    if name:
+                        story_context.setdefault("cast", {})[name] = c.get("role", "")
     if beats is None:
         beats = generate_story_beats(panel_entries, ch_title, aspect_ratio=aspect_ratio)
 
@@ -1090,6 +1535,30 @@ async def process_single_chapter(
     width = 1920 if aspect_ratio == "16:9" else 1080
     height = 1080 if aspect_ratio == "16:9" else 1920
 
+    ai_context_map = {}
+    if enable_ai_context:
+        try:
+            from ai_context_generator import identify_and_generate_ai_context
+            if progress_callback:
+                progress_callback(f"Generating bespoke AI character & scene context for Chapter {ch_num}...", 65)
+            ai_context_map = identify_and_generate_ai_context(
+                beats=beats,
+                chapter_title=ch_title,
+                ch_work_dir=ch_work_dir,
+                aspect_ratio=aspect_ratio,
+                width=width,
+                height=height,
+                progress_callback=progress_callback,
+            )
+        except Exception as exc:
+            print(f"[WARN] AI context generation skipped: {exc}")
+
+    frames_dir = ch_work_dir / "frames"
+    script_path = output_dir / f"chapter_{ch_str}_script.txt"
+    script_path.write_text(
+        f"{ch_title}\n\n" + "\n".join(b["narration"] for b in beats) + "\n", encoding="utf-8"
+    )
+
     segment_paths = []
     total_beats = len(beats)
     
@@ -1098,12 +1567,28 @@ async def process_single_chapter(
         panel_path = beat["panel"]
         narration = beat["narration"]
 
-        audio_path = audio_dir / f"{beat_id}.mp3"
+        audio_path = audio_dir / f"{beat_id}.wav"
         await synthesize_voiceover(narration, audio_path, voice=voice, speed_rate=speed_rate)
         duration = get_audio_duration(audio_path)
 
         segment_path = segments_dir / f"{beat_id}.mp4"
-        render_frame_video(panel_path, audio_path, segment_path, duration, width=width, height=height)
+        if beat_id in ai_context_map:
+            from ai_context_generator import render_enhanced_segment
+            render_enhanced_segment(
+                ai_context_map[beat_id],
+                audio_path,
+                segment_path,
+                duration,
+                width=width,
+                height=height,
+                has_zoom=True,
+            )
+        else:
+            frame_paths = [
+                compose_panel_frame(Path(p), width, height, frames_dir)
+                for p in (beat.get("panels") or [panel_path])
+            ]
+            render_frame_video(frame_paths, audio_path, segment_path, duration, width=width, height=height)
         segment_paths.append(segment_path)
 
         if progress_callback and (i % 5 == 0 or i == total_beats):
@@ -1125,25 +1610,45 @@ async def process_multi_chapters(
     voice: str = "en-US-ChristopherNeural",
     speed_rate: str = "+25%",
     aspect_ratio: str = "16:9",
-    use_llm: bool = False,
+    use_llm: bool = True,
+    enable_ai_context: bool = False,
     output_dir: Path = Path("output"),
     workspace_dir: Path = Path("workspace"),
+    merged_only: bool = False,
+    chapter_start: Optional[float] = None,
+    chapter_end: Optional[float] = None,
     progress_callback: Optional[Callable[[str, int], None]] = None,
 ) -> tuple[list[Path], Path]:
     all_chapters = discover_all_chapters(start_url)
-    
-    # Locate starting chapter index
-    start_idx = 0
-    clean_start = start_url.rstrip("/").lower()
-    for idx, c in enumerate(all_chapters):
-        if c["url"].rstrip("/").lower() == clean_start:
-            start_idx = idx
-            break
-            
-    to_process = all_chapters[start_idx : start_idx + max_chapters] if max_chapters > 0 else all_chapters[start_idx:]
+
+    if chapter_start is not None or chapter_end is not None:
+        # Explicit chapter range (e.g. 10-20): filter by the real chapter number
+        # rather than a positional slice, so it's correct even with numbering gaps
+        # (a missing chapter, a "chapter 18.5" side story, etc).
+        lo = chapter_start if chapter_start is not None else float("-inf")
+        hi = chapter_end if chapter_end is not None else float("inf")
+        to_process = [c for c in all_chapters if lo <= c["number"] <= hi]
+    else:
+        # Locate starting chapter index
+        start_idx = 0
+        clean_start = start_url.rstrip("/").lower()
+        for idx, c in enumerate(all_chapters):
+            if c["url"].rstrip("/").lower() == clean_start:
+                start_idx = idx
+                break
+
+        to_process = all_chapters[start_idx : start_idx + max_chapters] if max_chapters > 0 else all_chapters[start_idx:]
+
+    if not to_process:
+        available = ", ".join(str(c["number"]) for c in all_chapters[:10])
+        raise RuntimeError(
+            f"No chapters found in the requested range ({len(all_chapters)} chapters discovered total"
+            f"{f'; first few: {available}...' if available else ''})."
+        )
 
     chapter_videos: list[Path] = []
     total = len(to_process)
+    story_context: dict = {}
 
     for idx, ch in enumerate(to_process, start=1):
         if progress_callback:
@@ -1157,6 +1662,8 @@ async def process_multi_chapters(
             speed_rate=speed_rate,
             aspect_ratio=aspect_ratio,
             use_llm=use_llm,
+            enable_ai_context=enable_ai_context,
+            story_context=story_context,
             progress_callback=progress_callback,
         )
         chapter_videos.append(video_path)
@@ -1173,6 +1680,10 @@ async def process_multi_chapters(
         shutil.copy(all_series_videos[0], merged_output_path)
     else:
         concat_video_segments(all_series_videos, merged_output_path)
+    _write_series_script(output_dir)
+
+    if merged_only:
+        _remove_per_chapter_videos(all_series_videos, merged_output_path)
 
     if progress_callback:
         progress_callback("All chapters completed successfully!", 100)
@@ -1180,14 +1691,42 @@ async def process_multi_chapters(
     return chapter_videos, merged_output_path
 
 
+def _write_series_script(output_dir: Path) -> Path:
+    """Joins every chapter's narration script in this series folder into one file to post with the video."""
+    def chapter_num(p: Path) -> float:
+        m = re.search(r"chapter_(\d+(?:\.\d+)?)_script\.txt$", p.name)
+        return float(m.group(1)) if m else float("inf")
+
+    scripts = sorted(output_dir.glob("chapter_*_script.txt"), key=chapter_num)
+    combined = output_dir / "all_chapters_script.txt"
+    combined.write_text(
+        "\n\n".join(p.read_text(encoding="utf-8").strip() for p in scripts) + "\n", encoding="utf-8"
+    )
+    return combined
+
+
+def _remove_per_chapter_videos(chapter_videos: list[Path], merged_output_path: Path) -> None:
+    """Deletes individual chapter_XXX_video.mp4 files once they're folded into the
+    merged video, for users who only want the final combined output on disk.
+    Refuses to delete anything if the merge didn't actually produce a real file,
+    so a failed/silent merge can never leave the user with nothing in output/."""
+    if not merged_output_path.exists() or merged_output_path.stat().st_size == 0:
+        return
+    for p in chapter_videos:
+        if p.resolve() != merged_output_path.resolve() and p.exists():
+            p.unlink()
+
+
 async def process_chapter_urls(
     chapter_urls: list[str],
     voice: str = "en-US-ChristopherNeural",
     speed_rate: str = "+25%",
     aspect_ratio: str = "16:9",
-    use_llm: bool = False,
+    use_llm: bool = True,
+    enable_ai_context: bool = False,
     output_dir: Path = Path("output"),
     workspace_dir: Path = Path("workspace"),
+    merged_only: bool = False,
     progress_callback: Optional[Callable[[str, int], None]] = None,
 ) -> tuple[list[Path], Path]:
     """
@@ -1202,6 +1741,7 @@ async def process_chapter_urls(
     chapter_videos: list[Path] = []
     failures: list[tuple[str, str]] = []
     total = len(chapter_urls)
+    story_context: dict = {}
 
     existing_videos = discover_series_chapter_videos(output_dir)
     fallback_num = 0
@@ -1232,6 +1772,8 @@ async def process_chapter_urls(
                 speed_rate=speed_rate,
                 aspect_ratio=aspect_ratio,
                 use_llm=use_llm,
+                enable_ai_context=enable_ai_context,
+                story_context=story_context,
                 progress_callback=progress_callback,
             )
             chapter_videos.append(video_path)
@@ -1255,6 +1797,10 @@ async def process_chapter_urls(
         shutil.copy(all_series_videos[0], merged_output_path)
     else:
         concat_video_segments(all_series_videos, merged_output_path)
+    _write_series_script(output_dir)
+
+    if merged_only:
+        _remove_per_chapter_videos(all_series_videos, merged_output_path)
 
     if progress_callback:
         msg = "All chapters completed successfully!"
@@ -1278,8 +1824,8 @@ if __name__ == "__main__":
              "Mutually exclusive with --url/--chapters.",
     )
     parser.add_argument("--chapters", type=int, default=1, help="Number of chapters to process (used with --url)")
-    parser.add_argument("--voice", default="en-US-ChristopherNeural", help="TTS voice name")
-    parser.add_argument("--speed", default="+25%", help="TTS speed rate (e.g. +25%)")
+    parser.add_argument("--voice", default="am_michael", help="TTS voice name (Kokoro voice like am_michael, or an edge-tts voice name)")
+    parser.add_argument("--speed", default="+0%", help="TTS speed rate (e.g. +0% natural, +25% faster)")
     parser.add_argument("--aspect-ratio", default="16:9", choices=["16:9", "9:16"], help="Video aspect ratio")
     parser.add_argument("--output", default="output", help="Output directory")
     parser.add_argument("--workspace", default="workspace", help="Workspace directory")
@@ -1287,6 +1833,11 @@ if __name__ == "__main__":
         "--use-llm",
         action="store_true",
         help="Use LLM (OpenAI, requires API_KEY in .env) for narration script generation instead of the regex-based generator",
+    )
+    parser.add_argument(
+        "--ai-context",
+        action="store_true",
+        help="Generate bespoke cinematic AI character portraits & scene visuals with stylish context badges",
     )
 
     args = parser.parse_args()
@@ -1310,6 +1861,7 @@ if __name__ == "__main__":
                 speed_rate=args.speed,
                 aspect_ratio=args.aspect_ratio,
                 use_llm=args.use_llm,
+                enable_ai_context=args.ai_context,
                 output_dir=out_dir,
                 workspace_dir=work_dir,
                 progress_callback=progress,
@@ -1328,6 +1880,7 @@ if __name__ == "__main__":
                 speed_rate=args.speed,
                 aspect_ratio=args.aspect_ratio,
                 use_llm=args.use_llm,
+                enable_ai_context=args.ai_context,
                 output_dir=out_dir,
                 workspace_dir=work_dir,
                 progress_callback=progress,

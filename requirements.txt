@@ -7,3 +7,7 @@ uvicorn>=0.20.0
 opencv-python>=4.8.0
 openai>=1.40.0
 python-dotenv>=1.0.0
+# Local open-source TTS (preferred voice engine; edge-tts is the fallback)
+kokoro==0.7.16
+soundfile>=0.12
+spacy<3.8
